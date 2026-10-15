@@ -17,6 +17,7 @@ import android.provider.Settings
 import android.text.Editable
 import android.text.TextUtils
 import android.text.TextWatcher
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -26,6 +27,7 @@ import android.widget.EditText
 import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 
@@ -52,11 +54,49 @@ class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("hub", Context.MODE_PRIVATE) }
     private val shortcuts by lazy { settingsShortcuts() }
 
-    // ---------------------------------------------------------------- UI
+    // ---------------------------------------------------------------- Start
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // If the app crashes anywhere, save the error so we can show it next launch.
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            try {
+                applicationContext.getSharedPreferences("hub", Context.MODE_PRIVATE)
+                    .edit().putString("crash", Log.getStackTraceString(e)).commit()
+            } catch (ignored: Throwable) {
+            }
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }
+
+        val saved = prefs.getString("crash", null)
+        if (saved != null) {
+            prefs.edit().remove("crash").commit()
+            showText("BBB Labs Hub hit an error last time:\n\n$saved")
+            return
+        }
+
+        try {
+            buildUi()
+        } catch (t: Throwable) {
+            showText("BBB Labs Hub error while starting:\n\n" + Log.getStackTraceString(t))
+        }
+    }
+
+    private fun showText(msg: String) {
+        val tv = TextView(this).apply {
+            text = msg
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(dp(16), dp(32), dp(16), dp(16))
+            setTextIsSelectable(true)
+        }
+        val sv = ScrollView(this).apply { setBackgroundColor(Color.BLACK) }
+        sv.addView(tv)
+        setContentView(sv)
+    }
+
+    private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
@@ -79,12 +119,11 @@ class MainActivity : Activity() {
         }
         root.addView(countText)
 
-        // Action row: Settings / Startup / Home
+        // Action row: Settings / Startup
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val settingsBtn = smallButton("Settings") { showSettingsDialog() }
         startupBtn = smallButton("Startup: OFF") { toggleStartup() }
-        val homeBtn = smallButton("Set as home") { openHomeSettings() }
-        listOf(settingsBtn, startupBtn, homeBtn).forEach { b ->
+        listOf(settingsBtn, startupBtn).forEach { b ->
             style(b, false)
             actions.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { marginEnd = dp(6) })
@@ -157,13 +196,18 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (!::startupBtn.isInitialized || !::countText.isInitialized) return
         refreshStartupLabel()
         // Reload in the background so newly installed apps appear.
         Thread {
-            val list = loadApps()
-            runOnUiThread {
-                all = list
-                applyFilter()
+            try {
+                val list = loadApps()
+                runOnUiThread {
+                    all = list
+                    applyFilter()
+                }
+            } catch (t: Throwable) {
+                runOnUiThread { countText.text = "Couldn't load apps: ${t.message}" }
             }
         }.start()
     }
@@ -183,30 +227,34 @@ class MainActivity : Activity() {
             val isVrQuery = index == 1
             val results = try { pm.queryIntentActivities(q, 0) } catch (e: Exception) { emptyList() }
             for (ri in results) {
-                val info = ri.activityInfo ?: continue
-                val pkg = info.packageName
-                if (pkg == packageName) continue
-                if (!seen.add(pkg)) continue
+                try {
+                    val info = ri.activityInfo ?: continue
+                    val pkg = info.packageName
+                    if (pkg == packageName) continue
+                    if (!seen.add(pkg)) continue
 
-                val appInfo = info.applicationInfo
-                val flagGame = (appInfo.flags and ApplicationInfo.FLAG_IS_GAME) != 0
-                val catGame = Build.VERSION.SDK_INT >= 26 &&
-                        appInfo.category == ApplicationInfo.CATEGORY_GAME
+                    val appInfo = info.applicationInfo
+                    val flagGame = (appInfo.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                    val catGame = Build.VERSION.SDK_INT >= 26 &&
+                            appInfo.category == ApplicationInfo.CATEGORY_GAME
 
-                val launch = Intent(Intent.ACTION_MAIN).apply {
-                    setClassName(pkg, info.name)
-                    addCategory(if (isVrQuery) "com.oculus.intent.category.VR" else Intent.CATEGORY_LAUNCHER)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                out.add(
-                    AppEntry(
-                        label = ri.loadLabel(pm).toString(),
-                        pkg = pkg,
-                        intent = launch,
-                        isGame = flagGame || catGame || isVrQuery,
-                        icon = ri.loadIcon(pm)
+                    val launch = Intent(Intent.ACTION_MAIN).apply {
+                        setClassName(pkg, info.name)
+                        addCategory(if (isVrQuery) "com.oculus.intent.category.VR" else Intent.CATEGORY_LAUNCHER)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    out.add(
+                        AppEntry(
+                            label = ri.loadLabel(pm).toString(),
+                            pkg = pkg,
+                            intent = launch,
+                            isGame = flagGame || catGame || isVrQuery,
+                            icon = ri.loadIcon(pm)
+                        )
                     )
-                )
+                } catch (e: Throwable) {
+                    // Skip any single app that can't be read.
+                }
             }
         }
         return out.sortedBy { it.label.lowercase() }
@@ -286,7 +334,7 @@ class MainActivity : Activity() {
                     Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                 )
             } catch (e: Exception) {
-                launch(shortcuts.last())
+                // Not available on this device.
             }
         }
         refreshStartupLabel()
@@ -300,18 +348,6 @@ class MainActivity : Activity() {
             else -> "Startup: needs permission"
         }
         style(startupBtn, on && canOverlay())
-    }
-
-    private fun openHomeSettings() {
-        try {
-            startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
-        } catch (e: Exception) {
-            try {
-                startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
-            } catch (e2: Exception) {
-                Toast.makeText(this, "Home settings aren't available on this device", Toast.LENGTH_SHORT).show()
-            }
-        }
     }
 
     // ---------------------------------------------------------------- Styling helpers
